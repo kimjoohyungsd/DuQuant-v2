@@ -23,3 +23,5 @@ Rot.pkl
 pred/
 imgs/
 .codebuddy/
+.vendor/
+log/

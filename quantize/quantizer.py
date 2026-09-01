@@ -17,6 +17,95 @@ def round_ste(x: torch.Tensor):
     return (x.round() - x).detach() + x
 
 
+def _greedy_block_search(weight2d, block_size, max_rotation_step, other2d=None,
+                         score_func=None):
+    """One independent run of DuQuant's greedy block-rotation search on an
+    already block_size-wide 2D tensor `weight2d`: [rows, block_size].
+
+    This is exactly the per-block search that `UniformAffineQuantizer.rotation`
+    / `WeightQuantizer.rotation` used to run inline after reshaping the *whole*
+    tensor to (-1, block_size) -- which pools every group into one search and
+    therefore finds a single R that every group then reuses (block-diagonal
+    reuse of one [block_size, block_size] matrix). Factoring it out lets the
+    caller run it either once (that legacy behaviour) or once per group
+    (--diverse_rotation: an independent R per group, shape
+    [num_blocks, block_size, block_size]) with identical search logic either
+    way.
+    """
+    weight = weight2d.detach().clone()
+    _weight = weight.detach().clone()
+    exchange_ids = []
+    peak_values = []
+    other = other2d.detach().clone() if other2d is not None else None
+    _other = other.clone() if other is not None else None
+
+    Rot = get_rot(block_size, weight.device)
+    for j in range(max_rotation_step):
+        if score_func is not None:
+            weight_max = weight.abs().max(dim=0).values
+            other_max = other.abs().max(dim=0).values
+            r = score_func(weight_max, other_max).argmax().item()
+            peak_values.append(score_func(weight_max[r], other_max[r]).item())
+        else:
+            r, c = divmod(weight.argmax().item(), weight.shape[-1])
+            r2, c2 = divmod(weight.argmin().item(), weight.shape[-1])
+            peak_values.append((weight[r, c] - weight[r2, c2]).item())
+        exchange_id = r if weight[r, c].abs() > weight[r2, c2].abs() else r2
+        exchange_ids.append(exchange_id)
+        R = Rot.clone()
+        R = exchange_row_col(R, 0, exchange_id % block_size).to(weight)
+        weight = torch.matmul(weight, R)
+        if other is not None:
+            other = torch.matmul(other, R)
+
+    if score_func is not None:
+        weight_max = weight.abs().max(dim=0).values
+        other_max = other.abs().max(dim=0).values
+        r = score_func(weight_max, other_max).argmax().item()
+        peak_values.append(score_func(weight_max[r], other_max[r]).item())
+    else:
+        r, c = divmod(weight.argmax().item(), weight.shape[-1])
+        r2, c2 = divmod(weight.argmin().item(), weight.shape[-1])
+        peak_values.append((weight[r, c] - weight[r2, c2]).item())
+    exchange_id = r if weight[r, c].abs() > weight[r2, c2].abs() else r2
+    exchange_ids.append(exchange_id)
+
+    weight = _weight
+    other = _other
+    select_length = torch.argmin(torch.tensor(peak_values)).item()
+    exchange_ids = exchange_ids[:select_length]
+    peak_values = peak_values[:select_length + 1]
+
+    R_ = torch.eye(block_size).to(weight)
+    for exchange_id in exchange_ids:
+        R = Rot.clone()
+        R = exchange_row_col(R, 0, exchange_id % block_size).to(R_)
+        R_ = torch.matmul(R_, R)
+    weight = torch.matmul(weight, R_)
+    if other is not None:
+        other = torch.matmul(other, R_)
+    return (weight, exchange_ids, R_) if other is None else (
+        weight, other, exchange_ids, peak_values[select_length], R_)
+
+
+def _apply_block_rotation(x, R, block_size):
+    """Right-multiply the last dim of `x` (viewed as consecutive groups of
+    `block_size`) by R.
+
+    R is [block_size, block_size] (legacy DuQuant: the same matrix is reused
+    -- block-diagonally -- for every group) or
+    [num_blocks, block_size, block_size] (--diverse_rotation: an independent
+    matrix per group, so the effective transform is a true block-diagonal
+    matrix instead of one block repeated num_blocks times).
+    """
+    if R.dim() == 2:
+        x = x.reshape(-1, block_size)
+        return x.matmul(R)
+    num_blocks = R.shape[0]
+    x = x.reshape(-1, num_blocks, block_size)
+    return torch.einsum('gnb,nbc->gnc', x, R)
+
+
 class UniformAffineQuantizer(nn.Module):
     def __init__(
         self,
@@ -37,6 +126,7 @@ class UniformAffineQuantizer(nn.Module):
         rotate=True,
         max_rotation_step=1024,
         permutation_times=0,
+        diverse_rotation=False,
     ):
         """
         support cluster quantize
@@ -66,6 +156,13 @@ class UniformAffineQuantizer(nn.Module):
         self.rotate = rotate
         self.max_rotation_step = max_rotation_step
         self.quant_method = quant_method
+        # False (default): one greedy-searched [block_size, block_size] R is
+        #   reused block-diagonally for every group in the hidden dim (the
+        #   original DuQuant behaviour).
+        # True: an independent greedy search runs per group, so R becomes
+        #   [num_blocks, block_size, block_size] -- a genuine block-diagonal
+        #   rotation instead of one block repeated num_blocks times.
+        self.diverse_rotation = diverse_rotation
 
         init_value = 4.  # init value of learnable weight clipping
         if lwc:
@@ -231,72 +328,64 @@ class UniformAffineQuantizer(nn.Module):
                  i=0):
         if max_rotation_step is None:
             max_rotation_step = self.max_rotation_step
-        weight = weight.detach().clone()
-        _weight = weight.detach().clone()
+        # NOTE: like the original DuQuant algorithm, this collapses every
+        # leading dim (batch, seq, ...) into one flat "rows" axis -- the
+        # output is always 2D [-1, hidden_dim], not reshaped back to the
+        # input's original shape. Downstream code (permutation_zigzag's
+        # per-channel max, online_duquant_cali's next rotation() call) relies
+        # on that collapse.
         hidden_dim = weight.shape[-1]
-        exchange_ids = []
-        peak_values = []
+        num_blocks = hidden_dim // self.block_size
 
-        weight = weight.reshape(-1, self.block_size)
-        if other is not None:
-            _other = other.detach().clone()
-            other = other.reshape(-1, self.block_size)
+        if not self.diverse_rotation:
+            # Legacy DuQuant: pool every group into one search, then reuse the
+            # resulting [block_size, block_size] R block-diagonally.
+            weight2d = weight.detach().clone().reshape(-1, self.block_size)
+            other2d = other.detach().clone().reshape(
+                -1, self.block_size) if other is not None else None
+            result = _greedy_block_search(weight2d, self.block_size,
+                                          max_rotation_step, other2d,
+                                          score_func)
+            if other is None:
+                rotated, exchange_ids, R = result
+                return rotated.reshape(-1, hidden_dim), exchange_ids, R
+            rotated, rotated_other, exchange_ids, peak, R = result
+            return (rotated.reshape(-1, hidden_dim),
+                    rotated_other.reshape(-1, hidden_dim), exchange_ids, peak, R)
 
-        Rot = get_rot(self.block_size, weight.device)
-        for j in range(max_rotation_step):
-            if score_func is not None:
-                weight_max = weight.abs().max(dim=0).values
-                other_max = other.abs().max(dim=0).values
-                r = score_func(weight_max, other_max).argmax().item()
-                peak_values.append(
-                    score_func(weight_max[r], other_max[r]).item())
-
+        # --diverse_rotation: search one independent R per group, giving a
+        # true block-diagonal rotation of shape
+        # [num_blocks, block_size, block_size] instead of one block reused
+        # num_blocks times.
+        weight3d = weight.detach().clone().reshape(-1, num_blocks,
+                                                    self.block_size)
+        other3d = other.detach().clone().reshape(
+            -1, num_blocks, self.block_size) if other is not None else None
+        rotated_blocks, other_blocks, Rs = [], [], []
+        exchange_ids_all, peaks_all = [], []
+        for g in range(num_blocks):
+            other2d = other3d[:, g, :] if other3d is not None else None
+            result = _greedy_block_search(weight3d[:, g, :], self.block_size,
+                                          max_rotation_step, other2d,
+                                          score_func)
+            if other is None:
+                rotated, exchange_ids, R = result
             else:
-                r, c = divmod(weight.argmax().item(), weight.shape[-1])
-                r2, c2 = divmod(weight.argmin().item(), weight.shape[-1])
-                peak_values.append((weight[r, c] - weight[r2, c2]).item())
-            exchange_id = r if weight[r, c].abs() > weight[r2,
-                                                           c2].abs() else r2
-            exchange_ids.append(exchange_id)
-            R = Rot.clone()
-            R = exchange_row_col(R, 0,
-                                 exchange_id % self.block_size).to(weight)
-            weight = torch.matmul(weight, R)
-            if other is not None:
-                other = torch.matmul(other, R)
-
-        if score_func is not None:
-            weight_max = weight.abs().max(dim=0).values
-            other_max = other.abs().max(dim=0).values
-            r = score_func(weight_max, other_max).argmax().item()
-            peak_values.append(score_func(weight_max[r], other_max[r]).item())
-        else:
-            r, c = divmod(weight.argmax().item(), weight.shape[-1])
-            r2, c2 = divmod(weight.argmin().item(), weight.shape[-1])
-            peak_values.append((weight[r, c] - weight[r2, c2]).item())
-        exchange_id = r if weight[r, c].abs() > weight[r2, c2].abs() else r2
-        exchange_ids.append(exchange_id)
-
-        weight = _weight.detach().clone()
-        if other is not None:
-            other = _other.detach().clone()
-        select_length = torch.argmin(torch.tensor(peak_values)).item()
-        exchange_ids = exchange_ids[:select_length]
-        peak_values = peak_values[:select_length + 1]
-
-        R_ = torch.eye(self.block_size).to(weight)
-        for exchange_id in exchange_ids:
-            R = Rot.clone()
-            R = exchange_row_col(R, 0, exchange_id % self.block_size).to(R_)
-            R_ = torch.matmul(R_, R)
-        weight = torch.matmul(weight.reshape(-1, self.block_size),
-                              R_).reshape(-1, hidden_dim)
-        if other is not None:
-            other = torch.matmul(other.reshape(-1, self.block_size),
-                                 R_).reshape(-1, hidden_dim)
-        return (weight, exchange_ids,
-                R_) if other is None else (weight, other, exchange_ids,
-                                           peak_values[select_length], R_)
+                rotated, rotated_other, exchange_ids, peak, R = result
+                other_blocks.append(rotated_other)
+                peaks_all.append(peak)
+            rotated_blocks.append(rotated)
+            Rs.append(R)
+            exchange_ids_all.append(exchange_ids)
+        weight_out = torch.stack(rotated_blocks, dim=1).reshape(-1, hidden_dim)
+        R_stack = torch.stack(Rs, dim=0)  # [num_blocks, block_size, block_size]
+        if other is None:
+            return weight_out, exchange_ids_all, R_stack
+        other_out = torch.stack(other_blocks, dim=1).reshape(-1, hidden_dim)
+        # peak_values are per-group here (one greedy search per group); keep
+        # the same worst-case-across-groups convention `rotation()`'s callers
+        # already rely on for `peak_values[select_length]`.
+        return weight_out, other_out, exchange_ids_all, min(peaks_all), R_stack
 
 
     def online_duquant_cali(self, weight):
@@ -342,9 +431,9 @@ class UniformAffineQuantizer(nn.Module):
                     x_type = x.dtype
                     if self.permutation_list is not None:
                         for i in range(len(self.permutation_list)):
-                            x = x.reshape(-1, self.block_size)
                             R = self.R[i].to(x)
-                            x = x.matmul(R).reshape(x_size).squeeze(0)
+                            x = _apply_block_rotation(
+                                x, R, self.block_size).reshape(x_size).squeeze(0)
                             # if False:
                             if True:
                                 if len(self.permutation_list.shape) == 3:
@@ -359,9 +448,8 @@ class UniformAffineQuantizer(nn.Module):
                                         x.device)
                                     x = x[:, perm]
                     if len(self.R) > 0:
-                        x = x.reshape(-1, self.block_size)
                         R = self.R[-1].to(x)
-                        x = x.matmul(R).reshape(x_size)
+                        x = _apply_block_rotation(x, R, self.block_size).reshape(x_size)
         else:
             raise NotImplementedError
         return x
@@ -513,6 +601,7 @@ class WeightQuantizer(nn.Module):
         rotate=True,
         max_rotation_step=1024,
         permutation_times=0,
+        diverse_rotation=False,
     ):
         """
         support cluster quantize
@@ -542,6 +631,7 @@ class WeightQuantizer(nn.Module):
         self.rotate = rotate
         self.max_rotation_step = max_rotation_step
         self.quant_method = quant_method
+        self.diverse_rotation = diverse_rotation
 
         init_value = 4.  # init value of learnable weight clipping
         if lwc:
@@ -707,73 +797,62 @@ class WeightQuantizer(nn.Module):
                  i=0):
         if max_rotation_step is None:
             max_rotation_step = self.max_rotation_step
-        weight = weight.detach().clone()
-        _weight = weight.detach().clone()
+        # NOTE: like the original DuQuant algorithm, this collapses every
+        # leading dim (batch, seq, ...) into one flat "rows" axis -- the
+        # output is always 2D [-1, hidden_dim], not reshaped back to the
+        # input's original shape. Downstream code (permutation_zigzag's
+        # per-channel max, online_duquant_cali's next rotation() call) relies
+        # on that collapse.
         hidden_dim = weight.shape[-1]
-        exchange_ids = []
-        peak_values = []
+        num_blocks = hidden_dim // self.block_size
 
-        weight = weight.reshape(-1, self.block_size)
-        if other is not None:
-            _other = other.detach().clone()
-            other = other.reshape(-1, self.block_size)
+        if not self.diverse_rotation:
+            # Legacy DuQuant: pool every group into one search, then reuse the
+            # resulting [block_size, block_size] R block-diagonally.
+            weight2d = weight.detach().clone().reshape(-1, self.block_size)
+            other2d = other.detach().clone().reshape(
+                -1, self.block_size) if other is not None else None
+            result = _greedy_block_search(weight2d, self.block_size,
+                                          max_rotation_step, other2d,
+                                          score_func)
+            if other is None:
+                rotated, exchange_ids, R = result
+                return rotated.reshape(-1, hidden_dim), exchange_ids, R
+            rotated, rotated_other, exchange_ids, peak, R = result
+            return (rotated.reshape(-1, hidden_dim),
+                    rotated_other.reshape(-1, hidden_dim), exchange_ids, peak, R)
 
-        Rot = get_rot(self.block_size, weight.device)
-        for j in range(max_rotation_step):
-            if score_func is not None:
-                weight_max = weight.abs().max(dim=0).values
-                other_max = other.abs().max(dim=0).values
-                r = score_func(weight_max, other_max).argmax().item()
-                peak_values.append(
-                    score_func(weight_max[r], other_max[r]).item())
-
+        # --diverse_rotation: search one independent R per group, giving a
+        # true block-diagonal rotation of shape
+        # [num_blocks, block_size, block_size] instead of one block reused
+        # num_blocks times.
+        weight3d = weight.detach().clone().reshape(-1, num_blocks,
+                                                    self.block_size)
+        other3d = other.detach().clone().reshape(
+            -1, num_blocks, self.block_size) if other is not None else None
+        rotated_blocks, other_blocks, Rs = [], [], []
+        exchange_ids_all, peaks_all = [], []
+        for g in range(num_blocks):
+            other2d = other3d[:, g, :] if other3d is not None else None
+            result = _greedy_block_search(weight3d[:, g, :], self.block_size,
+                                          max_rotation_step, other2d,
+                                          score_func)
+            if other is None:
+                rotated, exchange_ids, R = result
             else:
-                r, c = divmod(weight.argmax().item(), weight.shape[-1])
-                r2, c2 = divmod(weight.argmin().item(), weight.shape[-1])
-                peak_values.append((weight[r, c] - weight[r2, c2]).item())
-            exchange_id = r if weight[r, c].abs() > weight[r2,
-                                                           c2].abs() else r2
-            exchange_ids.append(exchange_id)
-            R = Rot.clone()
-            R = exchange_row_col(R, 0,
-                                 exchange_id % self.block_size).to(weight)
-            weight = torch.matmul(weight, R)
-            if other is not None:
-                other = torch.matmul(other, R)
+                rotated, rotated_other, exchange_ids, peak, R = result
+                other_blocks.append(rotated_other)
+                peaks_all.append(peak)
+            rotated_blocks.append(rotated)
+            Rs.append(R)
+            exchange_ids_all.append(exchange_ids)
+        weight_out = torch.stack(rotated_blocks, dim=1).reshape(-1, hidden_dim)
+        R_stack = torch.stack(Rs, dim=0)  # [num_blocks, block_size, block_size]
+        if other is None:
+            return weight_out, exchange_ids_all, R_stack
+        other_out = torch.stack(other_blocks, dim=1).reshape(-1, hidden_dim)
+        return weight_out, other_out, exchange_ids_all, min(peaks_all), R_stack
 
-        if score_func is not None:
-            weight_max = weight.abs().max(dim=0).values
-            other_max = other.abs().max(dim=0).values
-            r = score_func(weight_max, other_max).argmax().item()
-            peak_values.append(score_func(weight_max[r], other_max[r]).item())
-        else:
-            r, c = divmod(weight.argmax().item(), weight.shape[-1])
-            r2, c2 = divmod(weight.argmin().item(), weight.shape[-1])
-            peak_values.append((weight[r, c] - weight[r2, c2]).item())
-        exchange_id = r if weight[r, c].abs() > weight[r2, c2].abs() else r2
-        exchange_ids.append(exchange_id)
-
-        weight = _weight.detach().clone()
-        if other is not None:
-            other = _other.detach().clone()
-        select_length = torch.argmin(torch.tensor(peak_values)).item()
-        exchange_ids = exchange_ids[:select_length]
-        peak_values = peak_values[:select_length + 1]
-
-        R_ = torch.eye(self.block_size).to(weight)
-        for exchange_id in exchange_ids:
-            R = Rot.clone()
-            R = exchange_row_col(R, 0, exchange_id % self.block_size).to(R_)
-            R_ = torch.matmul(R_, R)
-        weight = torch.matmul(weight.reshape(-1, self.block_size),
-                              R_).reshape(-1, hidden_dim)
-        if other is not None:
-            other = torch.matmul(other.reshape(-1, self.block_size),
-                                 R_).reshape(-1, hidden_dim)
-        return (weight, exchange_ids,
-                R_) if other is None else (weight, other, exchange_ids,
-                                           peak_values[select_length], R_)
-    
     def rotation_outlier(self,
                  weight,
                  max_rotation_step=None,
@@ -906,9 +985,9 @@ class WeightQuantizer(nn.Module):
                     x_type = x.dtype
                     if self.permutation_list is not None:
                         for i in range(len(self.permutation_list)):
-                            x = x.reshape(-1, self.block_size)
                             R = self.R[i].to(x)
-                            x = x.matmul(R).reshape(x_size).squeeze(0)
+                            x = _apply_block_rotation(
+                                x, R, self.block_size).reshape(x_size).squeeze(0)
                             # if False:
                             if True:
                                 if len(self.permutation_list.shape) == 3:
@@ -923,9 +1002,8 @@ class WeightQuantizer(nn.Module):
                                         x.device)
                                     x = x[:, perm]
                     if len(self.R) > 0:
-                        x = x.reshape(-1, self.block_size)
                         R = self.R[-1].to(x)
-                        x = x.matmul(R).reshape(x_size)
+                        x = _apply_block_rotation(x, R, self.block_size).reshape(x_size)
         else:
             raise NotImplementedError
         return x
@@ -1145,6 +1223,7 @@ class FixedScaleQuantizer(UniformAffineQuantizer):
         rotate=True,
         max_rotation_step=1024,
         permutation_times=0,
+        diverse_rotation=False,
     ):
         UniformAffineQuantizer.__init__(
             self,
@@ -1165,6 +1244,7 @@ class FixedScaleQuantizer(UniformAffineQuantizer):
             rotate,
             max_rotation_step,
             permutation_times,
+            diverse_rotation,
         )
         # Init scale & zero
         self.scale = scale

@@ -10,6 +10,7 @@ from pprint import pprint
 from parallel_utils import map_layers_to_multi_gpus, get_lowest_occupied_gpu
 import torch.nn as nn
 from quantize.duquant import duquant
+from quantize.blockwise_flatquant import blockwise_flatquant
 from tqdm import tqdm
 import utils
 from pathlib import Path
@@ -41,7 +42,7 @@ def evaluate(lm, args, logger):
         lm.model = lm.model.to(lm.device)
 
     if args.eval_ppl:
-        for dataset in ["wikitext2", "c4-new"]:
+        for dataset in args.eval_datasets:
             cache_testloader = f'{args.cache_dir}/testloader_{args.model_family}_{dataset}_all.cache'
             if os.path.exists(cache_testloader):
                 testloader = torch.load(cache_testloader, weights_only=False)
@@ -153,6 +154,12 @@ def main():
                         help="Seed for sampling the calibration data.")
     parser.add_argument("--tasks", default="")
     parser.add_argument("--eval_ppl", action="store_true")
+    parser.add_argument("--eval_datasets", nargs="+", default=["wikitext2"],
+                        choices=["wikitext2", "ptb", "c4", "ptb-new", "c4-new"],
+                        help="datasets to report perplexity on (--eval_ppl). "
+                             "c4-new needs a working HF download; wikitext2 is cached.")
+    parser.add_argument("--results_json", type=str, default=None,
+                        help="write the run configuration and measured PPL to this JSON")
     parser.add_argument("--num_fewshot", type=int, default=0)
     parser.add_argument("--wbits", type=int, default=4)
     parser.add_argument("--abits", type=int, default=16)
@@ -232,6 +239,27 @@ def main():
                         type=int,
                         default=128,
                         help="block size for rotation matrices")
+    parser.add_argument(
+        "--diverse_rotation",
+        default=False,
+        action="store_true",
+        help="Greedy block rotation with one independent [block_size, "
+             "block_size] R per group (shape [hidden//block_size, "
+             "block_size, block_size]), instead of the default DuQuant "
+             "behaviour of searching one R and reusing it block-diagonally "
+             "for every group.")
+    parser.add_argument(
+        "--quant_method", type=str, default="duquant",
+        choices=["duquant", "blockwise_flatquant"],
+        help="duquant: greedy block rotation (quantize/duquant.py). "
+             "blockwise_flatquant: per-DecoderLayer gradient-trained SVD "
+             "affine transform, one per Linear layer, sized to --block_size "
+             "(quantize/blockwise_flatquant.py, ported from Rotate-Test).")
+    parser.add_argument(
+        "--flat_lr", type=float, default=5e-3,
+        help="AdamW lr for the SVD trans parameters under "
+             "--quant_method blockwise_flatquant (matches Rotate-Test's own "
+             "example scripts, which override the 1e-5 file default to this).")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -239,14 +267,12 @@ def main():
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
 
-    if args.epochs > 0:
+    if args.epochs > 0 and args.quant_method == "duquant":
         assert args.lwc or args.let
 
     if (args.wbits < 16 and args.wbits >= 8) or (args.abits < 16
                                                  and args.abits >= 8):
         args.deactive_amp = True
-
-    args.quant_method = "duquant"
 
     # init logger
     args.output_dir = os.path.join(
@@ -265,12 +291,35 @@ def main():
     # load model
     if args.net is None:
         args.net = args.model.split('/')[-1]
-    args.model_family = args.net.split('-')[0]
+    # The tokenized-calibration/test caches are keyed by model_family, so families
+    # with DIFFERENT tokenizers must not collide. "Llama-2-7b-hf".split('-')[0] and
+    # "Llama-3.1-8B".split('-')[0] are both "Llama", which silently made a Llama-3 run
+    # reuse Llama-2-tokenized data (valid token ids, so no crash -- just garbage
+    # activations that overflow fp16 and surface as "Scales are not finite").
+    _net = args.net.lower()
+    if "llama-3" in _net or "llama3" in _net:
+        args.model_family = "Llama3"
+    elif "llama-2" in _net or "llama2" in _net:
+        args.model_family = "Llama2"
+    elif "qwen" in _net:
+        args.model_family = "Qwen" + ("3" if "qwen3" in _net else "")
+    else:
+        args.model_family = args.net.split('-')[0]
     lm = LMClass(args)
     lm.seqlen = 2048
     lm.model.eval()
     for param in lm.model.parameters():
         param.requires_grad = False
+
+    # UniformAffineQuantizer's own quant_method dispatch only knows 'duquant'
+    # (greedy rotation) and None (plain fake-quant, no rotation). Under
+    # --quant_method blockwise_flatquant the SVD affine transform is applied
+    # externally at the QuantLinear level (see quantize/int_linear.py's
+    # svd_trans hook and quantize/blockwise_flatquant.py), so the quantizers
+    # themselves must see quant_method=None -- passing 'blockwise_flatquant'
+    # through would hit UniformAffineQuantizer.init_duquant's
+    # NotImplementedError branch.
+    quantizer_quant_method = None if args.quant_method == "blockwise_flatquant" else args.quant_method
 
     args.weight_quant_params = {
         "n_bits": args.wbits,
@@ -280,10 +329,11 @@ def main():
         "group_size": args.group_size,
         "lwc": args.lwc,
         "swc": args.swc,
-        "quant_method": args.quant_method,
+        "quant_method": quantizer_quant_method,
         "block_size": args.block_size,
         "max_rotation_step": args.max_rotation_step,
         "permutation_times": args.permutation_times,
+        "diverse_rotation": args.diverse_rotation,
     }
     args.act_quant_params = {
         "n_bits": args.abits,
@@ -292,10 +342,11 @@ def main():
         "lac": args.lac,
         "act_group_size": args.act_group_size,
         "dynamic_method": args.a_dynamic_method,
-        "quant_method": args.quant_method,
+        "quant_method": quantizer_quant_method,
         "block_size": args.block_size,
         "max_rotation_step": args.max_rotation_step,
         "permutation_times": args.permutation_times,
+        "diverse_rotation": args.diverse_rotation,
     }
     args.q_quant_params = {
         "n_bits": args.abits,
@@ -363,26 +414,47 @@ def main():
                 seqlen=lm.seqlen,
             )
             torch.save(dataloader, cache_dataloader)
-        act_scales = None
-        act_shifts = None
-        if args.smooth:
-            act_scales = torch.load(args.act_scales)
-            act_shifts = torch.load(args.act_shifts)
-        duquant(
-            lm,
-            args,
-            dataloader,
-            act_scales,
-            act_shifts,
-            logger,
-        )
+        if args.quant_method == "blockwise_flatquant":
+            blockwise_flatquant(lm, args, dataloader, logger)
+        else:
+            act_scales = None
+            act_shifts = None
+            if args.smooth:
+                act_scales = torch.load(args.act_scales)
+                act_shifts = torch.load(args.act_shifts)
+            duquant(
+                lm,
+                args,
+                dataloader,
+                act_scales,
+                act_shifts,
+                logger,
+            )
         logger.info(time.time() - tick)
         if args.gptq:
             tick = time.time()
             with torch.no_grad():
                 gptq(lm, args, dataloader, logger)
             logger.info(time.time() - tick)
-    evaluate(lm, args, logger)
+    results = evaluate(lm, args, logger)
+
+    if args.results_json:
+        import json
+        payload = {
+            "model": args.model,
+            "wbits": args.wbits, "abits": args.abits,
+            "datatype": "MXFP4 (E2M1 + E8M0 shared scale, group=32)",
+            "block_size": args.block_size,
+            "permutation_times": args.permutation_times,
+            "max_rotation_step": args.max_rotation_step,
+            "diverse_rotation": args.diverse_rotation,
+            "smooth": args.smooth, "alpha": args.alpha, "gptq": args.gptq,
+            "ppl": {k: v for k, v in results.items() if isinstance(v, float)},
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.results_json)), exist_ok=True)
+        with open(args.results_json, "w") as f:
+            json.dump(payload, f, indent=2)
+        logger.info(f"wrote results to {args.results_json}")
 
 
 if __name__ == "__main__":

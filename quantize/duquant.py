@@ -81,10 +81,18 @@ def duquant(
         }
         layer_name_prefix = "model.layers"
     elif "qwen" in args.net.lower():
+        # Imported here, not at module scope: models/int_qwen_layer.py pulls in
+        # transformers.models.qwen2, which is absent from very old installs. A llama
+        # run must not fail just because Qwen support is unavailable.
+        from models.int_qwen_layer import QuantQwenDecoderLayer
         is_llama = True
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
+        # transformers >= 4.48 keeps a shared rotary embedding on the model and feeds
+        # (cos, sin) to each layer, so it has to follow embed_tokens onto the device.
+        if hasattr(model.model, "rotary_emb") and model.model.rotary_emb is not None:
+            model.model.rotary_emb = model.model.rotary_emb.to(dev)
         DecoderLayer = QuantQwenDecoderLayer
         pairs = {
             "q_proj": "qkv",
@@ -95,7 +103,7 @@ def duquant(
         layer_name_prefix = "model.layers"
     else:
         raise ValueError(
-            "Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen2.5 now"
+            "Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen2/Qwen2.5/Qwen3 now"
         )
 
     layers[0] = layers[0].to(dev)
@@ -123,6 +131,7 @@ def duquant(
             cache["attention_mask"] = kwargs["attention_mask"]
             if self.is_llama:
                 cache["position_ids"] = kwargs["position_ids"]
+            cache["position_embeddings"] = kwargs.get("position_embeddings", None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -148,7 +157,7 @@ def duquant(
         model.model.norm = model.model.norm.cpu()
     else:
         raise ValueError(
-            "Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen2.5 now"
+            "Only support for llama/Llama-2/Llama-3/Vicuna/Mistral/Qwen2/Qwen2.5/Qwen3 now"
         )
     torch.cuda.empty_cache()
 
@@ -178,6 +187,9 @@ def duquant(
         position_ids = cache["position_ids"]
     else:
         position_ids = None
+    # None on transformers versions that keep rotary_emb on the attention module;
+    # the decoder layers fall back to their own copy in that case.
+    position_embeddings = cache.get("position_embeddings", None)
 
     if args.resume:
         duquant_parameters = torch.load(
@@ -217,12 +229,14 @@ def duquant(
                     for j in range(args.nsamples):
                         fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0),
                                             attention_mask=attention_mask,
-                                            position_ids=position_ids)[0]
+                                            position_ids=position_ids,
+                                             position_embeddings=position_embeddings)[0]
                         if args.aug_loss:
                             fp_inps_2[j] = qlayer(
                                 quant_inps[j].unsqueeze(0),
                                 attention_mask=attention_mask,
-                                position_ids=position_ids)[0]
+                                position_ids=position_ids,
+                                             position_embeddings=position_embeddings)[0]
 
         # init smooth parameters
         set_quant_state(
@@ -315,7 +329,8 @@ def duquant(
                         quant_out = qlayer(quant_inps[index:index +
                                                       args.batch_size, ],
                                            attention_mask=attention_mask_batch,
-                                           position_ids=position_ids)[0]
+                                           position_ids=position_ids,
+                                             position_embeddings=position_embeddings)[0]
                         loss = loss_func(
                             fp_inps[index:index + args.batch_size, ],
                             quant_out)
@@ -359,7 +374,8 @@ def duquant(
                         set_registered_x_none(qlayer)
                         rotate_inps = qlayer(rotate_inps.unsqueeze(0),
                                              attention_mask=attention_mask,
-                                             position_ids=position_ids)[0][0]
+                                             position_ids=position_ids,
+                                             position_embeddings=position_embeddings)[0][0]
             qlayer.register_duquant_params()
             set_init_duquant_params_state(qlayer, True)
 
@@ -438,7 +454,8 @@ def duquant(
                         quant_out = qlayer(quant_inps[index:index +
                                                       args.batch_size, ],
                                            attention_mask=attention_mask_batch,
-                                           position_ids=position_ids)[0]
+                                           position_ids=position_ids,
+                                             position_embeddings=position_embeddings)[0]
                         loss = loss_func(
                             fp_inps[index:index + args.batch_size, ],
                             quant_out)
@@ -487,7 +504,8 @@ def duquant(
                     for j in range(args.nsamples):
                         quant_inps[j] = qlayer(quant_inps[j].unsqueeze(0),
                                                attention_mask=attention_mask,
-                                               position_ids=position_ids)[0]
+                                               position_ids=position_ids,
+                                             position_embeddings=position_embeddings)[0]
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
             duquant_parameters[i] = duquant_state_dict(qlayer)

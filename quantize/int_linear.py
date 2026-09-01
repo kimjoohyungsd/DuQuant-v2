@@ -48,8 +48,16 @@ class QuantLinear(nn.Module):
         self.init_duquant_params = torch.tensor(0) if weight_quant_params[
             'quant_method'] == 'duquant' else torch.tensor(1)
 
+        # Set by quantize/blockwise_flatquant.py (one SVDGroupTransMatrix per
+        # QuantLinear -- "하나의 LinearLayer당 하나의 Affine Matrix"), left
+        # None (no-op) for every other quant_method/path. See
+        # quantize/svd_trans.py for why X'=X@T, W'=W@T^{-T} preserves X@W^T.
+        self.svd_trans = None
+
     def forward(self, input: torch.Tensor):
         if self.use_act_quant and not self.disable_input_quant:
+            if self.svd_trans is not None:
+                input = self.svd_trans(input, inv_t=False)
             input = self.act_quantizer(input)
 
         if self.use_temporary_parameter:
@@ -59,7 +67,10 @@ class QuantLinear(nn.Module):
             if not self.init_duquant_params:
                 self.weight_quantizer.copy_duquant_params(self.act_quantizer)
                 self.init_duquant_params = torch.tensor(1)
-            weight = self.weight_quantizer(self.weight)
+            weight = self.weight
+            if self.svd_trans is not None:
+                weight = self.svd_trans(weight, inv_t=True)
+            weight = self.weight_quantizer(weight)
             bias = self.bias
         else:
             weight = self.weight
