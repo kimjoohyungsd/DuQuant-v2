@@ -36,6 +36,8 @@ def evaluate(lm, args, logger):
         assert input_device == output_device
         lm._device = input_device
         lm.model.model.embed_tokens.to(input_device)
+        if hasattr(lm.model.model, "rotary_emb") and lm.model.model.rotary_emb is not None:
+            lm.model.model.rotary_emb.to(input_device)
         lm.model.model.norm.to(output_device)
         lm.model.lm_head.to(output_device)
     else:
@@ -250,11 +252,43 @@ def main():
              "for every group.")
     parser.add_argument(
         "--quant_method", type=str, default="duquant",
-        choices=["duquant", "blockwise_flatquant"],
+        choices=["duquant", "blockwise_flatquant", "hadamard", "torq"],
         help="duquant: greedy block rotation (quantize/duquant.py). "
              "blockwise_flatquant: per-DecoderLayer gradient-trained SVD "
              "affine transform, one per Linear layer, sized to --block_size "
-             "(quantize/blockwise_flatquant.py, ported from Rotate-Test).")
+             "(quantize/blockwise_flatquant.py, ported from Rotate-Test). "
+             "hadamard: fixed randomized block Hadamard of --block_size applied "
+             "online (no greedy search, no calibration) -- same wrap / scale "
+             "setup as duquant, only the rotation differs (utils."
+             "random_hadamard_matrix + quantizer.init_duquant). "
+             "torq: TORQ (arXiv:2605.19561) two-level rotation, CALIBRATED from "
+             "this layer's activations -- R_inter (Macro-Equilibrium, equalizes "
+             "per-block energy across the --block_size blocks) then R_intra "
+             "(Micro-Alignment, spreads values across the 8 MXFP4 codewords "
+             "within a block); see quantize/torq.py and the --torq_* flags.")
+    parser.add_argument("--torq_eps_inter", type=float, default=1e-4,
+                        help="TORQ Algorithm 1 (R_inter) convergence threshold on "
+                             "max|block variance - target|.")
+    parser.add_argument("--torq_max_iter_inter", type=int, default=2000,
+                        help="TORQ Algorithm 1 (R_inter) max Givens-rotation steps.")
+    parser.add_argument("--torq_max_iter_intra", type=int, default=10,
+                        help="TORQ Algorithm 2 (R_intra) max alternating S-step/R-step "
+                             "rounds (paper default).")
+    parser.add_argument("--torq_k_top_frac", type=float, default=0.5,
+                        help="TORQ R_intra: fraction of the --block_size columns kept as "
+                             "the codebook-imbalance candidate pool each R-step round "
+                             "(paper default: K/2, Appendix A.5).")
+    parser.add_argument("--torq_num_pairs", type=int, default=None,
+                        help="TORQ R_intra: number of column pairs rotated per R-step "
+                             "round. Default: half the candidate pool.")
+    parser.add_argument("--torq_lambda", type=float, default=1.0,
+                        help="TORQ R_intra: weight of the pair-complementarity term in "
+                             "the column-pair selection score (Eq. 23).")
+    parser.add_argument("--torq_max_samples", type=int, default=8192,
+                        help="TORQ R_intra: max (token, block) instances used for the "
+                             "S-step / column-selection loop (subsampled if more are "
+                             "available -- keeps the O(samples) critical-angle search "
+                             "tractable).")
     parser.add_argument(
         "--flat_lr", type=float, default=5e-3,
         help="AdamW lr for the SVD trans parameters under "
@@ -311,15 +345,27 @@ def main():
     for param in lm.model.parameters():
         param.requires_grad = False
 
-    # UniformAffineQuantizer's own quant_method dispatch only knows 'duquant'
-    # (greedy rotation) and None (plain fake-quant, no rotation). Under
-    # --quant_method blockwise_flatquant the SVD affine transform is applied
-    # externally at the QuantLinear level (see quantize/int_linear.py's
-    # svd_trans hook and quantize/blockwise_flatquant.py), so the quantizers
-    # themselves must see quant_method=None -- passing 'blockwise_flatquant'
-    # through would hit UniformAffineQuantizer.init_duquant's
-    # NotImplementedError branch.
+    # UniformAffineQuantizer's own quant_method dispatch knows 'duquant' (greedy
+    # rotation), 'hadamard' (fixed randomized block Hadamard, online) and None
+    # (plain fake-quant, no rotation). Under --quant_method blockwise_flatquant
+    # the SVD affine transform is applied externally at the QuantLinear level
+    # (see quantize/int_linear.py's svd_trans hook and
+    # quantize/blockwise_flatquant.py), so the quantizers themselves must see
+    # quant_method=None -- passing 'blockwise_flatquant' through would hit
+    # UniformAffineQuantizer.init_duquant's NotImplementedError branch.
     quantizer_quant_method = None if args.quant_method == "blockwise_flatquant" else args.quant_method
+
+    # Split between quantize/torq.py's compute_r_inter (inter_* prefix stripped)
+    # and compute_r_intra (the rest) -- see torq.calibrate's own docstring.
+    args.torq_kwargs = {
+        "inter_eps": args.torq_eps_inter,
+        "inter_max_iter": args.torq_max_iter_inter,
+        "max_iter": args.torq_max_iter_intra,
+        "k_top_frac": args.torq_k_top_frac,
+        "num_pairs": args.torq_num_pairs,
+        "lam": args.torq_lambda,
+        "max_samples": args.torq_max_samples,
+    }
 
     args.weight_quant_params = {
         "n_bits": args.wbits,
@@ -334,6 +380,7 @@ def main():
         "max_rotation_step": args.max_rotation_step,
         "permutation_times": args.permutation_times,
         "diverse_rotation": args.diverse_rotation,
+        "torq_kwargs": args.torq_kwargs,
     }
     args.act_quant_params = {
         "n_bits": args.abits,
@@ -347,6 +394,7 @@ def main():
         "max_rotation_step": args.max_rotation_step,
         "permutation_times": args.permutation_times,
         "diverse_rotation": args.diverse_rotation,
+        "torq_kwargs": args.torq_kwargs,
     }
     args.q_quant_params = {
         "n_bits": args.abits,

@@ -219,7 +219,7 @@ def duquant(
         if torch.cuda.device_count() > 1:
             qlayer.mlp.to("cuda:1")
 
-        if args.quant_method == 'duquant':
+        if args.quant_method in ('duquant', 'torq'):
             set_init_duquant_params_state(qlayer, True)
 
         set_quant_state(qlayer, weight_quant=False, act_quant=False)
@@ -363,7 +363,7 @@ def duquant(
         smooth_and_let_inplace(qlayer, args)
 
         # real smooth and quantization
-        if args.quant_method == 'duquant':
+        if args.quant_method in ('duquant', 'torq'):
             set_init_duquant_params_state(qlayer, False)
             set_quant_state(qlayer, weight_quant=True, act_quant=True)
             if duquant_parameters.get(i):

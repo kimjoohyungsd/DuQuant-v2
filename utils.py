@@ -114,7 +114,7 @@ def get_rot(n, device='cpu'):
         assert False, 'No such rotate matrix'
 
 
-def get_hadamard(n): 
+def get_hadamard(n):
     if n == 1:
         return torch.tensor([[1.]], dtype=torch.float32)
     else:
@@ -122,3 +122,29 @@ def get_hadamard(n):
         H_n_minus_1 = get_hadamard(n//2)
         return torch.cat([torch.cat([H_n_minus_1, H_n_minus_1], dim=1),
                           torch.cat([H_n_minus_1, -H_n_minus_1], dim=1)], dim=0) / math.sqrt(2)
+
+
+_RANDOM_HADAMARD_CACHE = {}
+def random_hadamard_matrix(block_size, seed=0):
+    """Deterministic randomized Walsh-Hadamard matrix of shape
+    [block_size, block_size]:  H @ diag(s)  with s in {+1, -1}^block_size.
+
+    Orthogonal (H is orthonormal, sign flips keep it so), so used as a fixed
+    block-diagonal rotation it preserves X @ W^T exactly before quantization --
+    the QuaRot / SpinQuant "random Hadamard" transform, applied online instead of
+    DuQuant's greedy search.
+
+    Deterministic in (block_size, seed) via a private Generator, so every
+    quantizer that builds it -- weight and activation, every layer -- gets the
+    identical matrix without needing copy_duquant_params().
+    """
+    key = (block_size, seed)
+    if key not in _RANDOM_HADAMARD_CACHE:
+        assert block_size & (block_size - 1) == 0 and block_size > 0, \
+            f"random Hadamard block_size must be a power of two, got {block_size}"
+        H = get_hadamard(block_size)  # [block_size, block_size], orthonormal
+        g = torch.Generator().manual_seed(int(seed) + int(block_size))
+        signs = torch.randint(0, 2, (block_size,), generator=g,
+                              dtype=torch.float32) * 2.0 - 1.0
+        _RANDOM_HADAMARD_CACHE[key] = (H * signs.unsqueeze(0)).contiguous()
+    return _RANDOM_HADAMARD_CACHE[key].clone()

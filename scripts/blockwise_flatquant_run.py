@@ -14,6 +14,7 @@ quantize/duquant.py's greedy block rotation, not a variant of it, so results
 are compared against the same FP16 / duquant baselines already recorded in
 log/mxfp4_ablation/ and log/qwen/ rather than re-measured here.
 """
+
 import argparse
 import json
 import os
@@ -72,6 +73,7 @@ def run_one(args, model):
         '--batch_size', str(args.cali_bsz),
         '--flat_lr', str(args.flat_lr),
         '--nsamples', str(args.nsamples),
+        '--block_size', str(args.block_size)
         '--eval_ppl', '--eval_datasets', 'wikitext2',
         '--output_dir', log_dir,
         '--results_json', out_json,
@@ -127,7 +129,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--models', nargs='+',
                     default=['meta-llama/Llama-2-7b-hf', 'meta-llama/Llama-3.1-8B', 'Qwen/Qwen3-8B'])
-    ap.add_argument('--epochs', type=int, default=3,
+    ap.add_argument('--epochs', type=int, default=15,
                     help="Rotate-Test's own default is 15, calibrated for their (much "
                          "larger, hidden_size-wide Kronecker-decomposed) transform. This "
                          "port's transform is a single 32x32 matrix per Linear -- a far "
@@ -139,8 +141,10 @@ def main():
                          "uses eager (non-flash) attention at real seqlen=2048, and 4 OOMs "
                          "a 24GB GPU on an 8B model within the first layer; 2 is validated "
                          "to run all layers of a 7-8B model without OOM on a single 3090.")
+    ap.add_argument('--block_size', type=int, default=32,
+                    help="Rotate-Test's own default is 128, but this repo's MXFP4 Quantization aligns with MXFP4 group size of 32")
     ap.add_argument('--flat_lr', type=float, default=5e-3)
-    ap.add_argument('--nsamples', type=int, default=32,
+    ap.add_argument('--nsamples', type=int, default=128,
                     help="Rotate-Test's own default is 128; reduced 4x alongside --epochs "
                          "for the same wall-clock reason (matches quantize/duquant.py's "
                          "own greedy-rotation calibration in spirit -- both are one "

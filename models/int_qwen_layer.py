@@ -16,7 +16,7 @@ from quantize.int_linear import QuantLinear
 # so we take them from qwen2, which exists in every transformers that ships Qwen at
 # all. This keeps the layer importable even on installs without a `qwen3` module --
 # only *loading* a Qwen3 checkpoint needs transformers >= 4.51.
-from transformers.models.qwen2.modeling_qwen2 import (
+from transformers.models.qwen3.modeling_qwen3 import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
@@ -45,7 +45,7 @@ class QuantQwenMLP(nn.Module):
         self.act_fn = ACT2FN[hidden_act]
         self.init_duquant_params = torch.tensor(
             0) if args.gate_weight_quant_params[
-                'quant_method'] == 'duquant' else torch.tensor(1)
+                'quant_method'] in ('duquant', 'torq') else torch.tensor(1)
 
     def forward(self, x):
         if not self.init_duquant_params:
@@ -109,7 +109,7 @@ class QuantQwenAttention(nn.Module):
         self.use_act_quant = False
         self.init_duquant_params = torch.tensor(
             0) if args.gate_weight_quant_params[
-                'quant_method'] == 'duquant' else torch.tensor(1)
+                'quant_method'] in ('duquant', 'torq') else torch.tensor(1)
 
     def _rope(self, value_states, position_ids, kv_seq_len, position_embeddings):
         if position_embeddings is not None:

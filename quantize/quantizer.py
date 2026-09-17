@@ -4,10 +4,11 @@ import torch.nn.functional as F
 from typing import Union
 import numpy as np
 import math
-from utils import get_rot, exchange_row_col, get_hadamard
+from utils import get_rot, exchange_row_col, get_hadamard, random_hadamard_matrix
 from quantize.const import CLIPMAX, CLIPMIN
 import random
 from quantize.fp4_ops import cast_to_eBm0, cast_to_eBm0_improved, cast_to_e4m3, FP4_E2M1_MAX, FP8_E4M3_MAX, FP4_SCALE, cast_to_fp4, quantize_dequantize_fp4
+from quantize import torq
 
 
 def round_ste(x: torch.Tensor):
@@ -127,6 +128,7 @@ class UniformAffineQuantizer(nn.Module):
         max_rotation_step=1024,
         permutation_times=0,
         diverse_rotation=False,
+        torq_kwargs=None,
     ):
         """
         support cluster quantize
@@ -202,6 +204,22 @@ class UniformAffineQuantizer(nn.Module):
             self.H = get_hadamard(self.block_size)
         elif self.quant_method == 'duquant':
             self.R, self.permutation_list = [], []
+            if self.rotate is not False:
+                self.init_duquant_params = torch.tensor(0)
+        elif self.quant_method == 'hadamard':
+            # Fixed randomized block Hadamard applied online (no greedy search,
+            # no calibration): weight and activation build the identical matrix
+            # deterministically, so init_duquant_params stays 1 (nothing to fit).
+            self.R_had = random_hadamard_matrix(self.block_size)
+        elif self.quant_method == 'torq':
+            # TORQ (arXiv:2605.19561): (R_inter, R_intra) are CALIBRATED from
+            # this layer's actual input activations (quantize/torq.py), unlike
+            # hadamard's fixed matrix -- so, like duquant, needs calibration
+            # (init_duquant_params=0) and the weight quantizer copies the
+            # activation quantizer's pair via copy_duquant_params rather than
+            # building its own independently.
+            self.R_inter, self.R_intra = None, None
+            self.torq_kwargs = torq_kwargs or {}
             if self.rotate is not False:
                 self.init_duquant_params = torch.tensor(0)
 
@@ -450,6 +468,18 @@ class UniformAffineQuantizer(nn.Module):
                     if len(self.R) > 0:
                         R = self.R[-1].to(x)
                         x = _apply_block_rotation(x, R, self.block_size).reshape(x_size)
+        elif self.quant_method == 'hadamard':
+            if self.rotate:
+                x_size = x.shape
+                x = _apply_block_rotation(
+                    x, self.R_had.to(x), self.block_size).reshape(x_size)
+        elif self.quant_method == 'torq':
+            if self.rotate:
+                if not self.init_duquant_params:
+                    self.R_inter, self.R_intra = torq.calibrate(
+                        x.detach(), self.block_size, **self.torq_kwargs)
+                    self.init_duquant_params = torch.tensor(1)
+                x = torq.apply_torq_rotation(x, self.R_inter, self.R_intra, self.block_size)
         else:
             raise NotImplementedError
         return x
@@ -496,12 +526,12 @@ class UniformAffineQuantizer(nn.Module):
             x = x.reshape(-1, self.group_size)
         reduce_shape = [-1]
 
-        xmin = x.amin(reduce_shape, keepdim=True).to(x.device)
-        xmax = x.amax(reduce_shape, keepdim=True).to(x.device)
+        xmin = x.amin(reduce_shape, keepdim=True).to(x.device) # [bsz,seqlen,group_num]
+        xmax = x.amax(reduce_shape, keepdim=True).to(x.device) # [bsz,seqlen,group_num]
 
         q_max, q_min = 6, -6
         alpha = 1.0
-        scales = 2 * torch.maximum(-xmin, xmax) / (q_max - q_min) * alpha
+        scales = 2 * torch.maximum(-xmin, xmax) / (q_max - q_min) * alpha # 
         zeros = torch.zeros_like(xmin)
         self.round_zero_point = zeros.clamp(min=-CLIPMAX, max=CLIPMAX).round()
 
@@ -559,6 +589,18 @@ class UniformAffineQuantizer(nn.Module):
     def register_duquant_params(self):
         if self.rotate is not True:
             return
+        if self.quant_method == 'torq':
+            # (R_inter, R_intra) instead of duquant's (R, permutation_list) --
+            # same buffer-registration purpose (correct device/dtype
+            # propagation through qlayer.to()/.half()).
+            R_inter, R_intra = self.R_inter, self.R_intra
+            delattr(self, 'R_inter')
+            delattr(self, 'R_intra')
+            delattr(self, 'init_duquant_params')
+            self.register_buffer('R_inter', R_inter)
+            self.register_buffer('R_intra', R_intra)
+            self.register_buffer('init_duquant_params', torch.tensor(1))
+            return
         permutation_list, R = self.permutation_list, self.R
         delattr(self, 'R')
         delattr(self, 'permutation_list')
@@ -569,6 +611,12 @@ class UniformAffineQuantizer(nn.Module):
 
     def copy_duquant_params(self, quantizer_ref):
         if quantizer_ref.rotate is True:
+            if self.quant_method == 'torq':
+                assert quantizer_ref.init_duquant_params == True
+                self.R_inter = quantizer_ref.R_inter.clone().detach()
+                self.R_intra = quantizer_ref.R_intra.clone().detach()
+                self.init_duquant_params = torch.tensor(1)
+                return
             assert quantizer_ref.init_duquant_params == True
             self.R = quantizer_ref.R.clone().detach()
             try:
@@ -602,6 +650,7 @@ class WeightQuantizer(nn.Module):
         max_rotation_step=1024,
         permutation_times=0,
         diverse_rotation=False,
+        torq_kwargs=None,
     ):
         """
         support cluster quantize
@@ -671,6 +720,22 @@ class WeightQuantizer(nn.Module):
             self.H = get_hadamard(self.block_size)
         elif self.quant_method == 'duquant':
             self.R, self.permutation_list = [], []
+            if self.rotate is not False:
+                self.init_duquant_params = torch.tensor(0)
+        elif self.quant_method == 'hadamard':
+            # Fixed randomized block Hadamard applied online (no greedy search,
+            # no calibration): weight and activation build the identical matrix
+            # deterministically, so init_duquant_params stays 1 (nothing to fit).
+            self.R_had = random_hadamard_matrix(self.block_size)
+        elif self.quant_method == 'torq':
+            # TORQ (arXiv:2605.19561): (R_inter, R_intra) are CALIBRATED from
+            # this layer's actual input activations (quantize/torq.py), unlike
+            # hadamard's fixed matrix -- so, like duquant, needs calibration
+            # (init_duquant_params=0) and the weight quantizer copies the
+            # activation quantizer's pair via copy_duquant_params rather than
+            # building its own independently.
+            self.R_inter, self.R_intra = None, None
+            self.torq_kwargs = torq_kwargs or {}
             if self.rotate is not False:
                 self.init_duquant_params = torch.tensor(0)
 
@@ -1004,6 +1069,18 @@ class WeightQuantizer(nn.Module):
                     if len(self.R) > 0:
                         R = self.R[-1].to(x)
                         x = _apply_block_rotation(x, R, self.block_size).reshape(x_size)
+        elif self.quant_method == 'hadamard':
+            if self.rotate:
+                x_size = x.shape
+                x = _apply_block_rotation(
+                    x, self.R_had.to(x), self.block_size).reshape(x_size)
+        elif self.quant_method == 'torq':
+            if self.rotate:
+                if not self.init_duquant_params:
+                    self.R_inter, self.R_intra = torq.calibrate(
+                        x.detach(), self.block_size, **self.torq_kwargs)
+                    self.init_duquant_params = torch.tensor(1)
+                x = torq.apply_torq_rotation(x, self.R_inter, self.R_intra, self.block_size)
         else:
             raise NotImplementedError
         return x
@@ -1181,6 +1258,18 @@ class WeightQuantizer(nn.Module):
     def register_duquant_params(self):
         if self.rotate is not True:
             return
+        if self.quant_method == 'torq':
+            # (R_inter, R_intra) instead of duquant's (R, permutation_list) --
+            # same buffer-registration purpose (correct device/dtype
+            # propagation through qlayer.to()/.half()).
+            R_inter, R_intra = self.R_inter, self.R_intra
+            delattr(self, 'R_inter')
+            delattr(self, 'R_intra')
+            delattr(self, 'init_duquant_params')
+            self.register_buffer('R_inter', R_inter)
+            self.register_buffer('R_intra', R_intra)
+            self.register_buffer('init_duquant_params', torch.tensor(1))
+            return
         permutation_list, R = self.permutation_list, self.R
         delattr(self, 'R')
         delattr(self, 'permutation_list')
@@ -1191,6 +1280,12 @@ class WeightQuantizer(nn.Module):
 
     def copy_duquant_params(self, quantizer_ref):
         if quantizer_ref.rotate is True:
+            if self.quant_method == 'torq':
+                assert quantizer_ref.init_duquant_params == True
+                self.R_inter = quantizer_ref.R_inter.clone().detach()
+                self.R_intra = quantizer_ref.R_intra.clone().detach()
+                self.init_duquant_params = torch.tensor(1)
+                return
             assert quantizer_ref.init_duquant_params == True
             self.R = quantizer_ref.R.clone().detach()
             try:
@@ -1272,12 +1367,12 @@ class FixedScaleQuantizer(UniformAffineQuantizer):
             x = x.reshape(-1, self.group_size)
         reduce_shape = [-1]
 
-        xmin = x.amin(reduce_shape, keepdim=True).to(x.device)
-        xmax = x.amax(reduce_shape, keepdim=True).to(x.device)
+        xmin = x.amin(reduce_shape, keepdim=True).to(x.device) # [bsz,seq_len,num_group,1]
+        xmax = x.amax(reduce_shape, keepdim=True).to(x.device) # [bsz,seq_len,num_group,1]
 
         q_max, q_min = 6, -6
         alpha = 1.0
-        scales = 2 * torch.maximum(-xmin, xmax) / (q_max - q_min) * alpha
+        scales = 2 * torch.maximum(-xmin, xmax) / (q_max - q_min) * alpha # [bsz,seq_len,]
         zeros = torch.zeros_like(xmin)
         self.zero = zeros.clamp(min=-CLIPMAX, max=CLIPMAX).round()
 

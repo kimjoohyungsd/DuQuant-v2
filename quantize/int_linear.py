@@ -46,7 +46,7 @@ class QuantLinear(nn.Module):
         self.disable_input_quant = disable_input_quant
         self.use_temporary_parameter = False
         self.init_duquant_params = torch.tensor(0) if weight_quant_params[
-            'quant_method'] == 'duquant' else torch.tensor(1)
+            'quant_method'] in ('duquant', 'torq') else torch.tensor(1)
 
         # Set by quantize/blockwise_flatquant.py (one SVDGroupTransMatrix per
         # QuantLinear -- "하나의 LinearLayer당 하나의 Affine Matrix"), left

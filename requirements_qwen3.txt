@@ -1,0 +1,52 @@
+# requirements_qwen3.txt
+#
+# Dedicated environment for Qwen3 runs (scripts/torq/run_torq_Qwen3.sh,
+# scripts/env_utils.py's Qwen-path scripts). This repo's shared `flatquant`
+# conda env pins a transformers version that doesn't resolve the Qwen3
+# architecture (`transformers.models.qwen3`), so Qwen3 model loading needs a
+# python whose installed transformers actually supports it -- either this
+# dedicated env, or the .vendor/transformers_qwen3 PYTHONPATH fallback (see
+# .vendor/README.md). This file is for the former:
+#
+#   conda create -n duquant-qwen3 python=3.10 -y
+#   conda activate duquant-qwen3
+#   pip install -r requirements_qwen3.txt
+#   QWEN3_PYTHON=$(conda run -n duquant-qwen3 which python) \
+#       bash scripts/torq/run_torq_Qwen3.sh
+#
+# Everything below matches requirements.txt except the core package versions
+# ── [동시 업데이트 필수 코어 패키지] ── swapped for ones that actually resolve
+# Qwen3.
+
+# ─── [동시 업데이트 필수 코어 패키지] ───
+transformers==4.57.3
+tokenizers>=0.21.0
+accelerate>=0.34.0
+sentencepiece>=0.2.0
+
+# ─── everything else (same as requirements.txt) ───
+torch>=2.0.0
+torchvision
+datasets==2.17.1
+einops
+jsonlines
+numexpr
+openai>=0.6.4
+omegaconf>=2.2
+peft>=0.2.0
+pybind11>=2.6.2
+pycountry
+pytablewriter
+rouge-score>=0.0.4
+sacrebleu==1.5.0
+scikit-learn>=0.24.1
+sqlitedict
+tqdm-multiprocess
+zstandard
+lm-eval==0.4.4
+texttable
+toml
+attributedict
+protobuf
+jieba
+rouge

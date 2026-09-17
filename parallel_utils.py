@@ -132,13 +132,25 @@ def assign_layers_to_gpus(layers: List[nn.Module]):
 
 # forward hook
 def forward_hook_wrapper(gpu_id):
+    dev = f"cuda:{gpu_id}"
+
+    def _move(v):
+        # Recurse into tuples/lists so nested tensors are moved too. This is
+        # what carries `position_embeddings=(cos, sin)` (a tuple, so the old
+        # `isinstance(v, torch.Tensor)` check skipped it) onto this layer's
+        # GPU -- otherwise apply_rotary_pos_emb hits `q(cuda:i) * cos(cuda:j)`
+        # once the decoder layers span more than one device.
+        if isinstance(v, torch.Tensor):
+            return v.to(dev)
+        if isinstance(v, tuple):
+            return tuple(_move(x) for x in v)
+        if isinstance(v, list):
+            return [_move(x) for x in v]
+        return v
+
     def forward_hook(module, input, kwargs):
-        # breakpoint()
-        input = tuple(_.to(f"cuda:{gpu_id}") for _ in input)
-        kwargs = {
-            k: v.to(f"cuda:{gpu_id}") if isinstance(v, torch.Tensor) else v
-            for k, v in kwargs.items()
-        }
+        input = tuple(_move(x) for x in input)
+        kwargs = {k: _move(v) for k, v in kwargs.items()}
         return input, kwargs
 
     return forward_hook

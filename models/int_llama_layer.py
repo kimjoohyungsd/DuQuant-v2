@@ -36,7 +36,7 @@ class QuantLlamaMLP(nn.Module):
         self.act_fn = ACT2FN[hidden_act]
         self.init_duquant_params = torch.tensor(
             0) if args.gate_weight_quant_params[
-                'quant_method'] == 'duquant' else torch.tensor(1)
+                'quant_method'] in ('duquant', 'torq') else torch.tensor(1)
 
     def forward(self, x):
         if not self.init_duquant_params:
@@ -105,7 +105,7 @@ class QuantLlamaAttention(nn.Module):
         self.use_act_quant = False
         self.init_duquant_params = torch.tensor(
             0) if args.gate_weight_quant_params[
-                'quant_method'] == 'duquant' else torch.tensor(1)
+                'quant_method'] in ('duquant', 'torq') else torch.tensor(1)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads,
