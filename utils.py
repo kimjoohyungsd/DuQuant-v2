@@ -56,7 +56,7 @@ class NativeScalerWithGradNormCount:
         self._scaler.load_state_dict(state_dict)
 
 
-def create_logger(output_dir, dist_rank=0, name=''):
+def create_logger(output_dir, dist_rank=0, name='', filename=None):
     # create logger
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
@@ -76,7 +76,17 @@ def create_logger(output_dir, dist_rank=0, name=''):
         logger.addHandler(console_handler)
 
     # create file handlers
-    file_handler = logging.FileHandler(os.path.join(output_dir, f'log_rank{dist_rank}_{int(time.time())}.txt'), mode='a')
+    # The default name carries a wall-clock stamp, so every run of the same
+    # config leaves ANOTHER log_rank0_<epoch>.txt behind in output_dir and the
+    # directory grows one generation per run. A caller-supplied `filename`
+    # (main.py's --log_name) is fixed instead, and truncates, so re-running a
+    # config overwrites exactly its own log.
+    if filename:
+        log_path, mode = os.path.join(output_dir, filename), 'w'
+    else:
+        log_path, mode = os.path.join(
+            output_dir, f'log_rank{dist_rank}_{int(time.time())}.txt'), 'a'
+    file_handler = logging.FileHandler(log_path, mode=mode)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(fmt=fmt, datefmt='%Y-%m-%d %H:%M:%S'))
     logger.addHandler(file_handler)

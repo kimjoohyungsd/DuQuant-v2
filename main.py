@@ -162,6 +162,13 @@ def main():
                              "c4-new needs a working HF download; wikitext2 is cached.")
     parser.add_argument("--results_json", type=str, default=None,
                         help="write the run configuration and measured PPL to this JSON")
+    parser.add_argument("--log_name", type=str, default=None,
+                        help="fixed basename for this run's log file inside "
+                             "--output_dir (\".txt\" appended when missing). Without "
+                             "it the log is log_rank0_<epoch>.txt, i.e. a NEW file per "
+                             "run that piles up in the directory; a fixed name makes a "
+                             "re-run of the same config overwrite exactly its own log "
+                             "(what scripts/run_utils.py passes).")
     parser.add_argument("--num_fewshot", type=int, default=0)
     parser.add_argument("--wbits", type=int, default=4)
     parser.add_argument("--abits", type=int, default=16)
@@ -319,7 +326,10 @@ def main():
     if args.save_dir:
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
     output_dir = Path(args.output_dir)
-    logger = utils.create_logger(output_dir)
+    log_name = args.log_name
+    if log_name and not log_name.endswith(".txt"):
+        log_name += ".txt"
+    logger = utils.create_logger(output_dir, filename=log_name)
     logger.info(args)
 
     # load model
@@ -492,6 +502,8 @@ def main():
             "model": args.model,
             "wbits": args.wbits, "abits": args.abits,
             "datatype": "MXFP4 (E2M1 + E8M0 shared scale, group=32)",
+            "quant_method": args.quant_method,
+            "seed": args.seed, "nsamples": args.nsamples,
             "block_size": args.block_size,
             "permutation_times": args.permutation_times,
             "max_rotation_step": args.max_rotation_step,

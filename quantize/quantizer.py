@@ -1377,7 +1377,7 @@ class FixedScaleQuantizer(UniformAffineQuantizer):
         self.zero = zeros.clamp(min=-CLIPMAX, max=CLIPMAX).round()
 
         # scales = cast_to_eBm0(FP4_E2M1_MAX * scales, ebits=8, emax=2) / FP4_SCALE
-        scales = cast_to_eBm0_improved(scales, ebits=8, emax=2)
+        # scales = cast_to_eBm0_improved(scales, ebits=8, emax=2)
         # Set scales to 1 if zero
         scales[scales == 0] = 1
         if scales.isnan().any():

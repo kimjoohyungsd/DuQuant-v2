@@ -153,13 +153,13 @@ def compute_r_inter(acts: torch.Tensor, block_size: int, eps: float = 1e-4,
     argument, and its O(N*K*B^2) cost matches Appendix A.7's stated
     O(T*B^2*K) covariance-estimation complexity.)
     """
-    acts = acts.reshape(-1, acts.shape[-1]).to(torch.float64)
+    acts = acts.reshape(-1, acts.shape[-1]).to(torch.float64) # [Batch*Token, Dim]
     N, d = acts.shape
     assert d % block_size == 0, f"hidden dim {d} not a multiple of block_size {block_size}"
-    B = d // block_size
+    B = d // block_size # [Batch*Token, Num_Block, block_dim]
     # [N, B, K] -> [N, K, B] -> [N*K, B]: one row per (sample, position) pair,
     # each holding that position's value across all B blocks.
-    flat = acts.reshape(N, B, block_size).permute(0, 2, 1).reshape(-1, B)
+    flat = acts.reshape(N, B, block_size).permute(0, 2, 1).reshape(-1, B) # [Batch*Token, Block_size, Num_block] => [Batch*Token*Block_size,Num_Block]
     Sigma = (flat.t() @ flat) / max(flat.shape[0], 1)
     Sigma = Sigma + damping * torch.eye(B, dtype=Sigma.dtype, device=Sigma.device)
     R = _givens_variance_equalize(Sigma, eps=eps, max_iter=max_iter)
@@ -250,8 +250,17 @@ def _pair_loss_batched(u: torch.Tensor, v: torch.Tensor, thetas: torch.Tensor) -
     c, s = torch.cos(thetas), torch.sin(thetas)  # [M]
     u_rot = u.unsqueeze(1) * c - v.unsqueeze(1) * s  # [S, M]
     v_rot = u.unsqueeze(1) * s + v.unsqueeze(1) * c  # [S, M]
-    hu = _imbalance_scores(u_rot.t())  # [M]
-    hv = _imbalance_scores(v_rot.t())  # [M]
+    # _imbalance_scores(Z) already expects Z as [samples, columns] and pools
+    # over the *sample* axis (dim 0) to return one score per column (dim 1)
+    # -- it does its own internal transpose. u_rot/v_rot are already
+    # [S=samples, M=candidate angles], i.e. exactly that layout, so passing
+    # them WITHOUT an extra .t() is what gives one score per candidate angle
+    # (length M); the previous `.t()` here silently returned length S
+    # instead, which only happened not to crash in small hand-built tests
+    # where S < M by coincidence -- on real calibration data (S often != M,
+    # and sometimes S > M) it throws an out-of-bounds index in the caller.
+    hu = _imbalance_scores(u_rot)  # [M]
+    hv = _imbalance_scores(v_rot)  # [M]
     return hu + hv
 
 

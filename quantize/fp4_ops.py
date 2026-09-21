@@ -50,9 +50,17 @@ def cast_to_eBm0(x: torch.Tensor, ebits: int, emax: int):
     assert x.ge(0).all(), "EBm0 expects positive inputs"
     qmin = -(2 ** (ebits - 1) - 1)
     qmax = +(2 ** (ebits - 1) - 1)
-    # We clamp values instead of overflow (see https://github.com/microsoft/microxcaling/blob/7bc41952de394f5cc5e782baf132e7c7542eb4e4/mx/mx_ops.py#L83)
-    return 2 ** (x.clamp(min=FP32_MIN_NORMAL).log2().floor().clamp(qmin, qmax) - emax)
 
+    exponent = (
+        x.clamp(min=FP32_MIN_NORMAL)
+         .log2()
+         .floor()
+         - emax
+    )
+
+    exponent = exponent.clamp(qmin, qmax)
+    # We clamp values instead of overflow (see https://github.com/microsoft/microxcaling/blob/7bc41952de394f5cc5e782baf132e7c7542eb4e4/mx/mx_ops.py#L83)
+    return 2 ** exponent
 
 def cast_to_eBm0_improved(x: torch.Tensor, ebits: int, emax: int):
     """
