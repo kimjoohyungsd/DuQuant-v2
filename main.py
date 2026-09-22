@@ -113,6 +113,13 @@ def evaluate(lm, args, logger):
         metric_vals = {task: result for task, result in QAresults.items()}
         metric_vals['acc_avg'] = round(sum(metric_vals.values()) / len(metric_vals.values()), 2)
         logger.info(metric_vals)
+        # Previously computed but never threaded through: `results` (this
+        # function's return value, and what --results_json serializes) held
+        # only the PPL numbers, so zero-shot accuracy only ever reached the
+        # log text, never the JSON. Orchestration scripts that read
+        # --results_json (e.g. scripts/gptq_smooth_sweep/run_sweep.py) need
+        # it here too.
+        results['tasks'] = metric_vals
 
     return results
 
@@ -510,6 +517,7 @@ def main():
             "diverse_rotation": args.diverse_rotation,
             "smooth": args.smooth, "alpha": args.alpha, "gptq": args.gptq,
             "ppl": {k: v for k, v in results.items() if isinstance(v, float)},
+            "tasks": results.get('tasks', {}),
         }
         os.makedirs(os.path.dirname(os.path.abspath(args.results_json)), exist_ok=True)
         with open(args.results_json, "w") as f:
