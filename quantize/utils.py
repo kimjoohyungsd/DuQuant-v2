@@ -251,3 +251,21 @@ def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
     for m in self.modules():
         if isinstance(m, QuantLinear):
             m.set_quant_state(weight_quant, act_quant)
+
+
+def decoder_layer_output(out):
+    """Unwrap a decoder-layer call's return value into its hidden_states tensor.
+
+    QuantLlamaDecoderLayer (models/int_llama_layer.py) returns the historic
+    (hidden_states, ...) tuple, matching the transformers version this repo's
+    Llama path runs under. QuantQwenDecoderLayer (models/int_qwen_layer.py)
+    instead returns the bare tensor, matching the real (unmodified)
+    Qwen3DecoderLayer.forward contract under transformers>=4.51 (required for
+    Qwen3 support at all) -- Qwen3Model.forward does
+    `hidden_states = decoder_layer(...)` with no `[0]` unpacking, so a
+    tuple-returning layer would break the real top-level eval forward pass.
+    The manual per-layer calibration loops in quantize/duquant.py and
+    quantize/gptq.py call both kinds of layer through this same helper instead
+    of a bare `[0]` index, so they work for either return convention.
+    """
+    return out[0] if isinstance(out, tuple) else out

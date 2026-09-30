@@ -108,11 +108,17 @@ def assign_layers_to_gpus(layers: List[nn.Module]):
             sum(p.element_size() * p.numel() for p in layer.parameters()) / 1024**2
         )
         available_gpus = get_gpu_memory()
-        if prev_gpu_id is None:
-            gpus = sorted(available_gpus, key=lambda x: x[2])
-        else:
-            pre_gpu_info = available_gpus[prev_gpu_id]
-            gpus = [pre_gpu_info] + sorted(available_gpus, key=lambda x: x[2])
+        # Always try the currently least-loaded GPU first (real nvidia-smi
+        # usage, updated after every layer.to() call) instead of preferring
+        # the previous layer's GPU: preferring the previous GPU as long as it
+        # has *any* room -- the original behavior -- lets it accumulate a
+        # large majority of the layers before ever overflowing (observed:
+        # 28/40 layers on one GPU, 12/40 on the other, for Qwen3-14B), which
+        # then also inherits embed_tokens/norm/lm_head via evaluate()'s
+        # input_device == output_device == layers[0].device, OOMing that GPU
+        # even though the other sits nearly empty. Sorting by allocated
+        # memory every time balances layers close to evenly instead.
+        gpus = sorted(available_gpus, key=lambda x: x[2])
         mapped = False
         for gpu_id, tot_memory, allocated_memory in gpus:
         # for gpu_id, (gpu_id_, tot_memory, allocated_memory) in enumerate(gpus):

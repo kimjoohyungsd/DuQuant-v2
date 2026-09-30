@@ -1319,6 +1319,7 @@ class FixedScaleQuantizer(UniformAffineQuantizer):
         max_rotation_step=1024,
         permutation_times=0,
         diverse_rotation=False,
+        torq_kwargs=None,
     ):
         UniformAffineQuantizer.__init__(
             self,
@@ -1340,6 +1341,7 @@ class FixedScaleQuantizer(UniformAffineQuantizer):
             max_rotation_step,
             permutation_times,
             diverse_rotation,
+            torq_kwargs,
         )
         # Init scale & zero
         self.scale = scale

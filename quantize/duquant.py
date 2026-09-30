@@ -124,6 +124,12 @@ def duquant(
             super().__init__()
             self.module = module
             self.is_llama = False
+            # transformers>=4.51's masking_utils (create_causal_mask /
+            # create_sliding_window_causal_mask, used by e.g. Qwen3) reads
+            # model.model.layers[0].attention_type BEFORE calling into the
+            # layer, so this stand-in for layers[0] must carry it through too
+            # -- getattr default keeps Llama (which has no such attribute) working.
+            self.attention_type = getattr(module, "attention_type", "full_attention")
 
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
@@ -227,16 +233,16 @@ def duquant(
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
                     for j in range(args.nsamples):
-                        fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0),
+                        fp_inps[j] = decoder_layer_output(qlayer(fp_inps[j].unsqueeze(0),
                                             attention_mask=attention_mask,
                                             position_ids=position_ids,
-                                             position_embeddings=position_embeddings)[0]
+                                             position_embeddings=position_embeddings))
                         if args.aug_loss:
-                            fp_inps_2[j] = qlayer(
+                            fp_inps_2[j] = decoder_layer_output(qlayer(
                                 quant_inps[j].unsqueeze(0),
                                 attention_mask=attention_mask,
                                 position_ids=position_ids,
-                                             position_embeddings=position_embeddings)[0]
+                                             position_embeddings=position_embeddings))
 
         # init smooth parameters
         set_quant_state(
@@ -326,11 +332,11 @@ def duquant(
                     # obtain output of quantization model
                     with traincast():
                         smooth_and_quant_temporary(qlayer, args, is_llama)
-                        quant_out = qlayer(quant_inps[index:index +
+                        quant_out = decoder_layer_output(qlayer(quant_inps[index:index +
                                                       args.batch_size, ],
                                            attention_mask=attention_mask_batch,
                                            position_ids=position_ids,
-                                             position_embeddings=position_embeddings)[0]
+                                             position_embeddings=position_embeddings))
                         loss = loss_func(
                             fp_inps[index:index + args.batch_size, ],
                             quant_out)
@@ -372,10 +378,10 @@ def duquant(
                 with torch.no_grad():
                     with torch.cuda.amp.autocast():
                         set_registered_x_none(qlayer)
-                        rotate_inps = qlayer(rotate_inps.unsqueeze(0),
+                        rotate_inps = decoder_layer_output(qlayer(rotate_inps.unsqueeze(0),
                                              attention_mask=attention_mask,
                                              position_ids=position_ids,
-                                             position_embeddings=position_embeddings)[0][0]
+                                             position_embeddings=position_embeddings))[0]
             qlayer.register_duquant_params()
             set_init_duquant_params_state(qlayer, True)
 
@@ -451,11 +457,11 @@ def duquant(
                     # obtain output of quantization model
                     with traincast():
                         post_rotate_quant_temporary(qlayer, args)
-                        quant_out = qlayer(quant_inps[index:index +
+                        quant_out = decoder_layer_output(qlayer(quant_inps[index:index +
                                                       args.batch_size, ],
                                            attention_mask=attention_mask_batch,
                                            position_ids=position_ids,
-                                             position_embeddings=position_embeddings)[0]
+                                             position_embeddings=position_embeddings))
                         loss = loss_func(
                             fp_inps[index:index + args.batch_size, ],
                             quant_out)
@@ -502,10 +508,10 @@ def duquant(
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
                     for j in range(args.nsamples):
-                        quant_inps[j] = qlayer(quant_inps[j].unsqueeze(0),
+                        quant_inps[j] = decoder_layer_output(qlayer(quant_inps[j].unsqueeze(0),
                                                attention_mask=attention_mask,
                                                position_ids=position_ids,
-                                             position_embeddings=position_embeddings)[0]
+                                             position_embeddings=position_embeddings))
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
             duquant_parameters[i] = duquant_state_dict(qlayer)

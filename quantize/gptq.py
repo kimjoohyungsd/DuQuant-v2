@@ -20,8 +20,13 @@ def gptq(lm, args, dataloader, logger):
     use_cache = model.config.use_cache
     model.config.use_cache = False
     is_llama = False
-    # TODO(xcsong): support other archs
-    if "llama" in args.net.lower():
+    # Llama/Vicuna/Mistral/Qwen all use the same decoder-layer module names
+    # (self_attn.{q,k,v,o}_proj, mlp.{up,gate,down}_proj) and the same
+    # position_ids-based rotary path, so they share this branch -- matches
+    # quantize/duquant.py's own arch check just above the Catcher it defines.
+    _net = args.net.lower()
+    if ("llama" in _net or "vicuna" in _net or "mistral" in _net
+            or "qwen" in _net):
         is_llama = True
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
@@ -52,6 +57,12 @@ def gptq(lm, args, dataloader, logger):
             super().__init__()
             self.module = module
             self.is_llama = False
+            # transformers>=4.51's masking_utils (create_causal_mask /
+            # create_sliding_window_causal_mask, used by e.g. Qwen3) reads
+            # model.model.layers[0].attention_type BEFORE calling into the
+            # layer, so this stand-in for layers[0] must carry it through too
+            # -- getattr default keeps Llama (which has no such attribute) working.
+            self.attention_type = getattr(module, "attention_type", "full_attention")
 
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp
@@ -59,6 +70,10 @@ def gptq(lm, args, dataloader, logger):
             cache["attention_mask"] = kwargs["attention_mask"]
             if self.is_llama:
                 cache["position_ids"] = kwargs["position_ids"]
+            # transformers versions that keep rotary_emb on the model (not the
+            # layer) require it forwarded to each decoder layer call as
+            # position_embeddings -- matches quantize/duquant.py's own Catcher.
+            cache["position_embeddings"] = kwargs.get("position_embeddings", None)
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -75,7 +90,7 @@ def gptq(lm, args, dataloader, logger):
     # 3. move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
-    if "llama" in args.net.lower():
+    if is_llama:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
     else:
@@ -88,6 +103,7 @@ def gptq(lm, args, dataloader, logger):
         position_ids = cache["position_ids"]
     else:
         position_ids = None
+    position_embeddings = cache.get("position_embeddings", None)
 
     # 5. start gptq quantization
     quantizers = {}
@@ -166,7 +182,9 @@ def gptq(lm, args, dataloader, logger):
                 handles.append(subset[name].register_forward_hook(
                     add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                outs[j] = decoder_layer_output(layer(inps[j].unsqueeze(0), attention_mask=attention_mask,
+                                position_ids=position_ids,
+                                position_embeddings=position_embeddings))
             for h in handles:
                 h.remove()
 
@@ -193,9 +211,10 @@ def gptq(lm, args, dataloader, logger):
 
         # 5.2 get output of current layer, treat it as input for next layer
         for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0),
+            outs[j] = decoder_layer_output(layer(inps[j].unsqueeze(0),
                             attention_mask=attention_mask,
-                            position_ids=position_ids)[0]
+                            position_ids=position_ids,
+                            position_embeddings=position_embeddings))
 
         # 5.3 quantize weight optimized by gptq
         # NOTE(xcsong): After GPTQ quantization, we do

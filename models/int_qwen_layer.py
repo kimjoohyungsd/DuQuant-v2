@@ -233,6 +233,13 @@ class QuantQwenDecoderLayer(nn.Module):
     def __init__(self, config, ori_layer, args, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        # transformers>=4.51's Qwen3Model.forward indexes
+        # causal_mask_mapping[decoder_layer.attention_type] on every layer in
+        # model.model.layers -- this replacement layer must carry the
+        # original's attention_type through, or the plain top-level `model(...)`
+        # eval path (main.py's evaluate(), not the manual per-layer GPTQ/duquant
+        # calls) raises AttributeError once duquant() has swapped it in.
+        self.attention_type = getattr(ori_layer, "attention_type", "full_attention")
         self.self_attn = QuantQwenAttention(org_module=ori_layer.self_attn,
                                             config=config,
                                             args=args,
@@ -283,12 +290,19 @@ class QuantQwenDecoderLayer(nn.Module):
             hidden_states.to(self.mlp.up_proj.weight.device)).to(residual.device)
         hidden_states = residual + hidden_states
 
-        outputs = (hidden_states, )
-        if output_attentions:
-            outputs += (self_attn_weights, )
-        if use_cache:
-            outputs += (present_key_value, )
-        return outputs
+        # Real (unmodified) Qwen3DecoderLayer.forward under transformers>=4.51
+        # returns the bare tensor (no tuple) -- Qwen3Model.forward does
+        # `hidden_states = decoder_layer(...)` with no `[0]` unpacking, so this
+        # drop-in replacement must match that contract exactly to work when
+        # substituted into model.model.layers for the real top-level eval
+        # forward pass (main.py's evaluate()). output_attentions/use_cache are
+        # never requested True anywhere this repo calls Qwen layers, so
+        # dropping their tuple-extension (which the real class also dropped)
+        # costs nothing; quantize.utils.decoder_layer_output() is what the
+        # manual per-layer calibration loops (duquant.py, gptq.py) use to
+        # accept this bare-tensor return alongside QuantLlamaDecoderLayer's
+        # historic (hidden_states, ...) tuple return.
+        return hidden_states
 
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
         self.use_weight_quant = weight_quant
